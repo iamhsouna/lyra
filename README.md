@@ -70,6 +70,15 @@ if you installed the model elsewhere, pass `--model <dir>`.
 
 ## Install
 
+One line (bootstraps Rust via [rustup](https://rustup.rs) if needed, then
+installs `lyra` into `~/.cargo/bin`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/iamhsouna/lyra/main/install.sh | sh
+```
+
+Or from source:
+
 ```bash
 git clone https://github.com/iamhsouna/lyra
 cd lyra
@@ -77,6 +86,8 @@ cargo build --release
 # optional: install to ~/.cargo/bin
 cargo install --path .
 ```
+
+Pin a branch/tag with `LYRA_REF`, e.g. `curl … | LYRA_REF=v0.1.0 sh`.
 
 ## Usage — TUI
 
