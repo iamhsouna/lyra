@@ -94,7 +94,10 @@ lyra
 | `g` or `Ctrl-G` | generate |
 | `a` | abort the running job |
 | `r` | reset to defaults |
-| `Ctrl-Q` | quit (aborts if generating) |
+| `?` | open the help tab |
+| `s` (Run tab) | reroll the seed |
+| `n` (Run tab) | new output path |
+| `Ctrl-Q` / `Ctrl-C` | quit (aborts if generating) |
 
 Text editing: `Enter` saves, `Esc` cancels. The lyrics editor treats `Enter`
 as a new line and `Tab` (or `Ctrl-Enter`) as save.
@@ -118,8 +121,9 @@ lyra web --host 0.0.0.0 --port 9000
 ```
 
 The page mirrors the TUI: the same setting tabs and preview, a **Generate** /
-**Abort** bar, live log streaming (Server-Sent Events), preset save/load/delete,
-a download link for the finished `.wav`, and recent-run history.
+**Abort** bar, live log streaming, preset save/load/delete, a download link for
+the finished `.wav`, and recent-run history. Keyboard: `1`-`6` switch tabs,
+`Ctrl+Enter` generates, `Esc` aborts.
 
 > The web UI has no authentication. Bind to `127.0.0.1` (the default) or only
 > expose it on a trusted network.
@@ -191,16 +195,22 @@ Local JSON API used by the web UI:
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/` | the single-page UI |
-| `GET` | `/api/state` | fields, values, options, preview, warnings, paths, presets, history, status |
-| `POST` | `/api/field` | `{id, action: "cycle-"\|"cycle+"\|"toggle"\|"set", value?}` |
+| `GET` | `/api/health` | liveness probe (`{ok, version}`) |
+| `GET` | `/api/state` | fields, values, options, preview, warnings/errors, paths, presets, history, status |
+| `GET` | `/api/log?since=N` | incremental job log: `{job_id, next, lines, running, status, success, out, wall_ms, exists}` |
+| `POST` | `/api/field` | `{id, action: "cycle-"\|"cycle+"\|"toggle"\|"reroll"\|"set", value?}` |
 | `POST` | `/api/select` | `{id, index}` (select fields; `0` = auto where applicable) |
-| `POST` | `/api/generate` | start a job (409 if one is running) |
+| `POST` | `/api/generate` | start a job (409 if one is running, 400 with `errors` if setup is incomplete) |
 | `POST` | `/api/abort` | kill the running job |
-| `GET` | `/api/events` | SSE: `data:` log lines, then an `event: done` with status/output |
+| `POST` | `/api/reset` | restore default settings (keeps the output path) |
 | `GET` | `/api/download?path=…` | download a `.wav` under `$HOME` |
 | `POST` | `/api/presets/save` | `{name}` → save current config |
 | `POST` | `/api/presets/load` | `{name}` |
 | `POST` | `/api/presets/delete` | `{name}` |
+
+The browser UI streams the log by polling `/api/log` (incremental, cursor-based).
+`tiny_http` buffers chunked responses, so a long-lived Server-Sent Events stream is
+not reliable — polling is used instead.
 
 ## Architecture
 
@@ -210,7 +220,7 @@ src/
               validation, presets, history
   runner.rs   spawns audiocpp_cli, streams its log, tracks status/abort
   tui.rs      tabbed terminal UI (ratatui + crossterm)
-  web.rs      tiny_http server + embedded single-page UI (SSE log stream)
+  web.rs      tiny_http server + embedded single-page UI (incremental log poll)
   detect.rs   finds the binary, model dir, backend, and component GGUFs
   main.rs     CLI parsing, TUI event loop, `web` subcommand
 ```

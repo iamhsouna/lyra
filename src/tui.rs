@@ -1,13 +1,16 @@
-use crate::core::{self, Config, Field, Group, Kind, ADVANCED_FIELDS, COMPONENT_FIELDS, SONG_FIELDS};
+use crate::core::{
+    self, ADVANCED_FIELDS, COMPONENT_FIELDS, Config, Field, Group, Kind, SONG_FIELDS,
+};
 use crate::detect::Paths;
 use crate::runner::{Job, Status};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
-use ratatui::Frame;
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 const ACCENT: Color = Color::Cyan;
 const TITLE: Color = Color::Magenta;
@@ -46,6 +49,7 @@ impl Tab {
     }
 }
 
+#[derive(Clone)]
 pub struct TextInput {
     buf: Vec<char>,
     cursor: usize,
@@ -83,11 +87,47 @@ impl TextInput {
             self.cursor += 1;
         }
     }
+    fn line_start(&self, at: usize) -> usize {
+        self.buf[..at.min(self.buf.len())]
+            .iter()
+            .rposition(|&c| c == '\n')
+            .map(|i| i + 1)
+            .unwrap_or(0)
+    }
+    fn line_end(&self, at: usize) -> usize {
+        self.buf[at.min(self.buf.len())..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map(|i| at + i)
+            .unwrap_or(self.buf.len())
+    }
     pub fn home(&mut self) {
-        self.cursor = 0;
+        self.cursor = self.line_start(self.cursor);
     }
     pub fn end(&mut self) {
-        self.cursor = self.buf.len();
+        self.cursor = self.line_end(self.cursor);
+    }
+    pub fn up(&mut self) {
+        let (_, col) = self.line_col();
+        let start = self.line_start(self.cursor);
+        if start == 0 {
+            self.cursor = 0;
+            return;
+        }
+        let prev_start = self.line_start(start - 1);
+        let prev_end = start - 1;
+        self.cursor = (prev_start + col).min(prev_end);
+    }
+    pub fn down(&mut self) {
+        let (_, col) = self.line_col();
+        let end = self.line_end(self.cursor);
+        if end >= self.buf.len() {
+            self.cursor = self.buf.len();
+            return;
+        }
+        let next_start = end + 1;
+        let next_end = self.line_end(next_start);
+        self.cursor = (next_start + col).min(next_end);
     }
     pub fn line_col(&self) -> (usize, usize) {
         let mut line = 0;
@@ -104,11 +144,13 @@ impl TextInput {
     }
 }
 
+#[derive(Clone)]
 enum EditTarget {
     Field(Field),
     PresetName,
 }
 
+#[derive(Clone)]
 struct Editor {
     target: EditTarget,
     input: TextInput,
@@ -132,6 +174,9 @@ pub struct TuiApp {
     spinner: u64,
     log_offset: usize,
     finished: bool,
+    form_scroll: u16,
+    editor_scroll: (u16, u16),
+    status_at: Option<Instant>,
 }
 
 impl TuiApp {
@@ -155,6 +200,9 @@ impl TuiApp {
             spinner: 0,
             log_offset: 0,
             finished: false,
+            form_scroll: 0,
+            editor_scroll: (0, 0),
+            status_at: None,
         };
         app.apply_default_components();
         app
@@ -194,11 +242,11 @@ impl TuiApp {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-        if ctrl && key.code == KeyCode::Char('q') {
-            if self.moving() {
-                if let Some(j) = &self.job {
-                    j.abort();
-                }
+        if ctrl && (key.code == KeyCode::Char('q') || key.code == KeyCode::Char('c')) {
+            if self.moving()
+                && let Some(j) = &self.job
+            {
+                j.abort();
             }
             self.should_quit = true;
             return;
@@ -207,8 +255,18 @@ impl TuiApp {
             self.generate();
             return;
         }
+        if ctrl
+            && key.code == KeyCode::Char('r')
+            && let Some(j) = &self.job
+        {
+            j.record();
+        }
 
         match key.code {
+            KeyCode::Char('?') => {
+                self.tab = Tab::Help;
+                self.selected = 0;
+            }
             KeyCode::Tab => self.switch_tab(1),
             KeyCode::BackTab => self.switch_tab(-1),
             KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
@@ -278,7 +336,10 @@ impl TuiApp {
             KeyCode::Char('g') => self.generate(),
             KeyCode::Char('r') => {
                 let out = self.cfg.out.clone();
-                self.cfg = Config { out, ..Config::default() };
+                self.cfg = Config {
+                    out,
+                    ..Config::default()
+                };
                 self.apply_default_components();
             }
             KeyCode::Esc => self.tab = Tab::Song,
@@ -304,6 +365,11 @@ impl TuiApp {
             KeyCode::Char('n') => {
                 self.cfg.out = core::default_out();
                 self.finished = false;
+                self.set_status("new output path");
+            }
+            KeyCode::Char('s') => {
+                self.cfg.seed = core::random_seed();
+                self.set_status(format!("seed → {}", self.cfg.seed));
             }
             KeyCode::Esc => self.tab = Tab::Song,
             _ => {}
@@ -321,11 +387,11 @@ impl TuiApp {
                 }
             }
             KeyCode::Enter => {
-                if let Some(name) = self.preset_names.get(self.preset_idx).cloned() {
-                    if let Some(cfg) = self.presets.get(&name) {
-                        self.cfg = cfg.clone();
-                        self.status_msg = Some(format!("loaded preset '{name}'"));
-                    }
+                if let Some(name) = self.preset_names.get(self.preset_idx).cloned()
+                    && let Some(cfg) = self.presets.get(&name)
+                {
+                    self.cfg = cfg.clone();
+                    self.set_status(format!("loaded preset '{name}'"));
                 }
             }
             KeyCode::Char('s') => {
@@ -340,13 +406,13 @@ impl TuiApp {
                     self.presets.remove(&name);
                     core::save_presets(&self.presets);
                     self.reload_presets();
-                    self.status_msg = Some(format!("deleted preset '{name}'"));
+                    self.set_status(format!("deleted preset '{name}'"));
                 }
             }
             KeyCode::Char('r') => {
                 self.cfg = Config::default();
                 self.apply_default_components();
-                self.status_msg = Some("reset to defaults".into());
+                self.set_status("reset to defaults");
             }
             KeyCode::Esc => self.tab = Tab::Song,
             _ => {}
@@ -370,6 +436,7 @@ impl TuiApp {
             input: TextInput::new(&cur),
             multiline: f == Field::Lyrics,
         });
+        self.editor_scroll = (0, 0);
     }
 
     fn editor_key(&mut self, key: KeyEvent) {
@@ -383,6 +450,16 @@ impl TuiApp {
             KeyCode::Enter => {
                 if let Some(e) = self.edit.as_mut() {
                     e.input.insert('\n');
+                }
+            }
+            KeyCode::Up if multiline => {
+                if let Some(e) = self.edit.as_mut() {
+                    e.input.up();
+                }
+            }
+            KeyCode::Down if multiline => {
+                if let Some(e) = self.edit.as_mut() {
+                    e.input.down();
                 }
             }
             _ => {
@@ -404,16 +481,41 @@ impl TuiApp {
                         self.presets.insert(name.clone(), self.cfg.clone());
                         core::save_presets(&self.presets);
                         self.reload_presets();
-                        self.status_msg = Some(format!("saved preset '{name}'"));
+                        self.set_status(format!("saved preset '{name}'"));
                     }
                 }
             }
         }
     }
 
+    fn set_status(&mut self, msg: impl Into<String>) {
+        self.status_msg = Some(msg.into());
+        self.status_at = Some(Instant::now());
+    }
+
+    fn transient_status(&self) -> bool {
+        match &self.status_msg {
+            Some(m) => {
+                !(m.contains("fail")
+                    || m.contains("error")
+                    || m.contains("✗")
+                    || m.contains("⚠")
+                    || m.contains("missing"))
+            }
+            None => false,
+        }
+    }
+
     pub fn generate(&mut self) {
         if self.moving() {
-            self.status_msg = Some("already generating — press a to abort".into());
+            self.set_status("already generating — press a to abort");
+            return;
+        }
+        self.cfg.sanitize();
+        let errors = self.cfg.errors(&self.paths);
+        if !errors.is_empty() {
+            self.set_status(format!("cannot start: {}", errors.join("; ")));
+            self.tab = Tab::Run;
             return;
         }
         match Job::start(&self.paths, &self.cfg) {
@@ -425,7 +527,7 @@ impl TuiApp {
                 self.status_msg = None;
                 self.tab = Tab::Run;
             }
-            Err(e) => self.status_msg = Some(format!("launch failed: {e}")),
+            Err(e) => self.set_status(format!("launch failed: {e}")),
         }
     }
 
@@ -436,11 +538,19 @@ impl TuiApp {
             let st = j.status();
             if !st.is_running() && !self.finished {
                 self.finished = true;
-                let ok = st == Status::Success;
-                j.record(ok);
+                j.record();
                 self.history = core::load_history();
-                self.status_msg = Some(st.label());
+                self.set_status(st.label());
             }
+        }
+        if self.transient_status()
+            && self
+                .status_at
+                .map(|t| t.elapsed().as_secs() > 6)
+                .unwrap_or(false)
+        {
+            self.status_msg = None;
+            self.status_at = None;
         }
     }
 
@@ -467,11 +577,17 @@ impl TuiApp {
     }
 
     fn draw_tabs(&self, f: &mut Frame, area: Rect) {
-        let mut spans = vec![Span::styled(" ✦ Lyra ", Style::default().fg(TITLE).add_modifier(Modifier::BOLD))];
+        let mut spans = vec![Span::styled(
+            " ✦ Lyra ",
+            Style::default().fg(TITLE).add_modifier(Modifier::BOLD),
+        )];
         for (name, tab) in TABS {
             let active = *tab == self.tab;
             let style = if active {
-                Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(DIM)
             };
@@ -479,18 +595,24 @@ impl TuiApp {
             spans.push(Span::styled(format!(" {name} "), style));
         }
         spans.push(Span::styled(
-            format!("   {}", self.cfg.caption().chars().take(60).collect::<String>()),
+            format!(
+                "   {}",
+                self.cfg.caption().chars().take(60).collect::<String>()
+            ),
             Style::default().fg(DIM),
         ));
-        let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(TITLE));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(TITLE));
         f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
     }
 
-    fn draw_form(&self, f: &mut Frame, area: Rect) {
+    fn draw_form(&mut self, f: &mut Frame, area: Rect) {
         let cols = Layout::horizontal([Constraint::Length(42), Constraint::Min(24)]).split(area);
         let fields = self.fields();
         let mut lines: Vec<Line> = Vec::new();
         let mut last_group: Option<Group> = None;
+        let mut selected_line: u16 = 0;
         for (i, field) in fields.iter().enumerate() {
             if Some(field.group()) != last_group {
                 last_group = Some(field.group());
@@ -500,28 +622,51 @@ impl TuiApp {
                 )));
             }
             let selected = i == self.selected;
+            if selected {
+                selected_line = lines.len() as u16;
+            }
             let marker = if selected { "▶ " } else { "  " };
             let label = format!("{:<24}", field.label());
             let val_style = match field.kind() {
-                Kind::Bool => Style::default().fg(if core::value_string(&self.cfg, *field) == "true" { OK } else { DIM }),
+                Kind::Bool => {
+                    Style::default().fg(if core::value_string(&self.cfg, *field) == "true" {
+                        OK
+                    } else {
+                        DIM
+                    })
+                }
                 Kind::Select => Style::default().fg(ACCENT),
                 _ => Style::default().fg(Color::White),
             };
             let name_style = if selected {
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(DIM)
             };
             lines.push(Line::from(vec![
                 Span::styled(marker, Style::default().fg(ACCENT)),
                 Span::styled(label, name_style),
-                Span::styled(truncate(&core::value_string(&self.cfg, *field), 40), val_style),
+                Span::styled(
+                    truncate(&core::value_string(&self.cfg, *field), 40),
+                    val_style,
+                ),
             ]));
         }
+        let view_h = cols[0].height.saturating_sub(2);
+        let total = lines.len() as u16;
+        if selected_line < self.form_scroll {
+            self.form_scroll = selected_line;
+        } else if view_h > 0 && selected_line >= self.form_scroll + view_h {
+            self.form_scroll = selected_line + 1 - view_h;
+        }
+        self.form_scroll = self.form_scroll.min(total.saturating_sub(view_h));
         f.render_widget(
             Paragraph::new(Text::from(lines))
                 .block(Block::default().borders(Borders::ALL).title(" settings "))
-                .wrap(Wrap { trim: false }),
+                .wrap(Wrap { trim: false })
+                .scroll((self.form_scroll, 0)),
             cols[0],
         );
         self.draw_detail(f, cols[1]);
@@ -552,21 +697,33 @@ impl TuiApp {
 
     fn draw_preview(&self, f: &mut Frame, area: Rect) {
         let mut lines: Vec<Line> = Vec::new();
-        lines.push(Line::from(Span::styled(" Caption", Style::default().fg(ACCENT).bold())));
+        lines.push(Line::from(Span::styled(
+            " Caption",
+            Style::default().fg(ACCENT).bold(),
+        )));
         for l in wrap(&self.cfg.caption(), area.width.saturating_sub(3) as usize) {
             lines.push(Line::raw(format!("  {l}")));
         }
         lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(" Lyrics", Style::default().fg(ACCENT).bold())));
+        lines.push(Line::from(Span::styled(
+            " Lyrics",
+            Style::default().fg(ACCENT).bold(),
+        )));
         for l in self.cfg.lyrics_text().lines().take(12) {
             lines.push(Line::raw(format!("  {l}")));
         }
         let warns = self.cfg.warnings(&self.paths);
         if !warns.is_empty() {
             lines.push(Line::raw(""));
-            lines.push(Line::from(Span::styled(" Warnings", Style::default().fg(ERR).bold())));
+            lines.push(Line::from(Span::styled(
+                " Warnings",
+                Style::default().fg(ERR).bold(),
+            )));
             for w in warns {
-                lines.push(Line::from(Span::styled(format!("  • {w}"), Style::default().fg(ERR))));
+                lines.push(Line::from(Span::styled(
+                    format!("  • {w}"),
+                    Style::default().fg(ERR),
+                )));
             }
         }
         f.render_widget(
@@ -587,11 +744,23 @@ impl TuiApp {
 
         let warnings = self.cfg.warnings(&self.paths);
         let mut head: Vec<Line> = Vec::new();
-        head.push(Line::from(Span::styled(" command", Style::default().fg(ACCENT).bold())));
-        head.push(Line::raw("  ".to_string() + &truncate(&core::shell_join(&core::build_argv(&self.paths, &self.cfg)), 2000)));
+        head.push(Line::from(Span::styled(
+            " command",
+            Style::default().fg(ACCENT).bold(),
+        )));
+        head.push(Line::raw(
+            "  ".to_string()
+                + &truncate(
+                    &core::shell_join(&core::build_argv(&self.paths, &self.cfg)),
+                    2000,
+                ),
+        ));
         if !warnings.is_empty() {
             for w in warnings {
-                head.push(Line::from(Span::styled(format!("  ⚠ {w}"), Style::default().fg(ERR))));
+                head.push(Line::from(Span::styled(
+                    format!("  ⚠ {w}"),
+                    Style::default().fg(ERR),
+                )));
             }
         }
         f.render_widget(
@@ -629,7 +798,10 @@ impl TuiApp {
                 status.push(Line::from(vec![
                     Span::styled(format!(" {spin} "), Style::default().fg(TITLE)),
                     Span::styled("composing…", Style::default().fg(Color::White).bold()),
-                    Span::styled(format!("  {:.0}s", j.elapsed_secs()), Style::default().fg(ACCENT)),
+                    Span::styled(
+                        format!("  {:.0}s", j.elapsed_secs()),
+                        Style::default().fg(ACCENT),
+                    ),
                     Span::styled("   a abort", Style::default().fg(DIM)),
                 ]));
             }
@@ -640,9 +812,15 @@ impl TuiApp {
                     Status::Aborted => (ERR, "aborted".into()),
                     _ => (ERR, format!("✗ {}", st.label())),
                 };
-                status.push(Line::from(Span::styled(format!(" {m}"), Style::default().fg(c).bold())));
                 status.push(Line::from(Span::styled(
-                    format!(" wall {:.1}s · n new path · Enter/g regenerate", j.wall_ms() / 1000.0),
+                    format!(" {m}"),
+                    Style::default().fg(c).bold(),
+                )));
+                status.push(Line::from(Span::styled(
+                    format!(
+                        " wall {:.1}s · n new path · Enter/g regenerate",
+                        j.wall_ms() / 1000.0
+                    ),
                     Style::default().fg(DIM),
                 )));
             }
@@ -655,12 +833,17 @@ impl TuiApp {
         }
         if let Some(h) = self.history.last() {
             status.push(Line::from(Span::styled(
-                format!(" last: {} ({:.1}s)", truncate(&h.out, 60), h.wall_ms / 1000.0),
+                format!(
+                    " last: {} ({:.1}s)",
+                    truncate(&h.out, 60),
+                    h.wall_ms / 1000.0
+                ),
                 Style::default().fg(DIM),
             )));
         }
         f.render_widget(
-            Paragraph::new(Text::from(status)).block(Block::default().borders(Borders::ALL).title(" status ")),
+            Paragraph::new(Text::from(status))
+                .block(Block::default().borders(Borders::ALL).title(" status ")),
             rows[2],
         );
     }
@@ -668,7 +851,10 @@ impl TuiApp {
     fn draw_presets(&self, f: &mut Frame, area: Rect) {
         let cols = Layout::horizontal([Constraint::Length(38), Constraint::Min(24)]).split(area);
         let items: Vec<Line> = if self.preset_names.is_empty() {
-            vec![Line::from(Span::styled("  (no presets yet)", Style::default().fg(DIM)))]
+            vec![Line::from(Span::styled(
+                "  (no presets yet)",
+                Style::default().fg(DIM),
+            ))]
         } else {
             self.preset_names
                 .iter()
@@ -677,7 +863,9 @@ impl TuiApp {
                     if i == self.preset_idx {
                         Line::from(Span::styled(
                             format!(" ▶ {n}"),
-                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD),
                         ))
                     } else {
                         Line::from(Span::styled(format!("   {n}"), Style::default().fg(DIM)))
@@ -695,21 +883,34 @@ impl TuiApp {
         let mut detail: Vec<Line> = Vec::new();
         if let Some(name) = self.preset_names.get(self.preset_idx) {
             if let Some(c) = self.presets.get(name) {
-                detail.push(Line::from(Span::styled(format!(" {name}"), Style::default().fg(ACCENT).bold())));
+                detail.push(Line::from(Span::styled(
+                    format!(" {name}"),
+                    Style::default().fg(ACCENT).bold(),
+                )));
                 detail.push(Line::raw(""));
                 for field in core::ALL_FIELDS {
                     detail.push(Line::from(vec![
                         Span::styled(format!(" {:<24}", field.label()), Style::default().fg(DIM)),
-                        Span::styled(truncate(&core::value_string(c, *field), 40), Style::default().fg(Color::White)),
+                        Span::styled(
+                            truncate(&core::value_string(c, *field), 40),
+                            Style::default().fg(Color::White),
+                        ),
                     ]));
                 }
             }
         } else {
-            detail.push(Line::from(Span::styled("  Enter load · s save current as · d delete · r reset", Style::default().fg(DIM))));
+            detail.push(Line::from(Span::styled(
+                "  Enter load · s save current as · d delete · r reset",
+                Style::default().fg(DIM),
+            )));
         }
         f.render_widget(
             Paragraph::new(Text::from(detail))
-                .block(Block::default().borders(Borders::ALL).title(" preset details "))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" preset details "),
+                )
                 .wrap(Wrap { trim: false }),
             cols[1],
         );
@@ -717,34 +918,62 @@ impl TuiApp {
 
     fn draw_help(&self, f: &mut Frame, area: Rect) {
         let mut lines: Vec<Line> = Vec::new();
-        let head = |t: &str| Line::from(Span::styled(format!(" {t}"), Style::default().fg(TITLE).bold()));
+        let head = |t: &str| {
+            Line::from(Span::styled(
+                format!(" {t}"),
+                Style::default().fg(TITLE).bold(),
+            ))
+        };
         let body = |t: &str| Line::from(Span::styled(format!("   {t}"), Style::default().fg(DIM)));
         lines.push(head("Navigation"));
-        lines.push(body("Tab / Shift-Tab or 1-6 switch tabs · ↑/↓ move · ←/→ adjust values"));
-        lines.push(body("Enter edit text / toggle / cycle · Space toggle/cycle · Esc back to Song"));
+        lines.push(body(
+            "Tab / Shift-Tab or 1-6 switch tabs · ↑/↓ move · ←/→ adjust values",
+        ));
+        lines.push(body(
+            "Enter edit text / toggle / cycle · Space toggle/cycle · Esc back to Song",
+        ));
         lines.push(body("g or Ctrl-G generate · a abort · Ctrl-Q quit"));
         lines.push(Line::raw(""));
         lines.push(head("The workflow"));
-        lines.push(body("1 Song: style, mood, vocals, caption override, lyrics, length, steps, output"));
-        lines.push(body("2 Advanced: CFG scales, top-k, seed, flow/perf tuning, memory options"));
-        lines.push(body("3 Components: backend + which LM / flow / depth GGUF to load"));
-        lines.push(body("4 Run: preview + warnings, live log, status; regenerate or reroll seed"));
-        lines.push(body("5 Presets: save/load named configs (stored in ~/.config/lyra/presets.json)"));
+        lines.push(body(
+            "1 Song: style, mood, vocals, caption override, lyrics, length, steps, output",
+        ));
+        lines.push(body(
+            "2 Advanced: CFG scales, top-k, seed, flow/perf tuning, memory options",
+        ));
+        lines.push(body(
+            "3 Components: backend + which LM / flow / depth GGUF to load",
+        ));
+        lines.push(body(
+            "4 Run: preview + warnings, live log, status; regenerate or reroll seed",
+        ));
+        lines.push(body(
+            "5 Presets: save/load named configs (stored in ~/.config/lyra/presets.json)",
+        ));
         lines.push(Line::raw(""));
         lines.push(head("Option notes"));
         for field in core::ALL_FIELDS {
             lines.push(Line::from(vec![
-                Span::styled(format!("   {:<24}", field.label()), Style::default().fg(ACCENT)),
+                Span::styled(
+                    format!("   {:<24}", field.label()),
+                    Style::default().fg(ACCENT),
+                ),
                 Span::styled(field.help().to_string(), Style::default().fg(DIM)),
             ]));
         }
         lines.push(Line::raw(""));
         lines.push(head("Model"));
         for w in self.cfg.warnings(&self.paths) {
-            lines.push(Line::from(Span::styled(format!("   ⚠ {w}"), Style::default().fg(ERR))));
+            lines.push(Line::from(Span::styled(
+                format!("   ⚠ {w}"),
+                Style::default().fg(ERR),
+            )));
         }
         if self.cfg.warnings(&self.paths).is_empty() {
-            lines.push(Line::from(Span::styled("   ✓ setup looks good", Style::default().fg(OK))));
+            lines.push(Line::from(Span::styled(
+                "   ✓ setup looks good",
+                Style::default().fg(OK),
+            )));
         }
         f.render_widget(
             Paragraph::new(Text::from(lines))
@@ -758,30 +987,37 @@ impl TuiApp {
         let line = match &self.status_msg {
             Some(m) => Line::from(Span::styled(format!(" {m}"), Style::default().fg(ACCENT))),
             None => Line::from(Span::styled(
-                " Tab switch · ↑/↓ field · ←/→ adjust · Enter edit · g generate · ? help (6) · Ctrl-Q quit",
+                " Tab switch · ↑/↓ field · ←/→ adjust · Enter edit · g generate · ? help · Ctrl-Q quit",
                 Style::default().fg(DIM),
             )),
         };
         f.render_widget(
-            Paragraph::new(line).block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(DIM))),
+            Paragraph::new(line).block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(DIM)),
+            ),
             area,
         );
     }
 
-    fn draw_editor(&self, f: &mut Frame) {
-        let Some(ed) = &self.edit else { return };
+    fn draw_editor(&mut self, f: &mut Frame) {
+        let Some(ed) = self.edit.clone() else { return };
         let area = centered(f.area(), 70, if ed.multiline { 60 } else { 20 });
         f.render_widget(Clear, area);
         let (title, hint) = match ed.target {
             EditTarget::Field(field) => (
                 format!(" {} ", field.label()),
                 if ed.multiline {
-                    "Enter = new line · Ctrl-Enter or Tab = save · Esc = cancel"
+                    "Enter = new line · ↑/↓ move · Ctrl-Enter or Tab = save · Esc = cancel"
                 } else {
                     "Enter = save · Esc = cancel"
                 },
             ),
-            EditTarget::PresetName => (" save preset as ".to_string(), "Enter = save · Esc = cancel"),
+            EditTarget::PresetName => (
+                " save preset as ".to_string(),
+                "Enter = save · Esc = cancel",
+            ),
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -789,15 +1025,47 @@ impl TuiApp {
             .title(title);
         let inner = block.inner(area);
         f.render_widget(block, area);
+        if inner.height < 1 || inner.width < 1 {
+            return;
+        }
         let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
-        f.render_widget(Paragraph::new(Text::from(ed.input.as_string())), rows[0]);
+        let (cline, ccol) = ed.input.line_col();
+
+        let view_h = rows[0].height as usize;
+        let view_w = rows[0].width as usize;
+        let (mut sy, mut sx) = self.editor_scroll;
+        let syu = sy as usize;
+        let sxu = sx as usize;
+        if cline < syu {
+            sy = cline as u16;
+        } else if view_h > 0 && cline >= syu + view_h {
+            sy = (cline + 1 - view_h) as u16;
+        }
+        if ccol < sxu {
+            sx = ccol as u16;
+        } else if view_w > 0 && ccol >= sxu + view_w {
+            sx = (ccol + 1 - view_w) as u16;
+        }
+        self.editor_scroll = (sy, sx);
+
+        let plain = ed.input.as_string();
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(format!(" {hint}"), Style::default().fg(DIM))))
-                .alignment(Alignment::Left),
+            Paragraph::new(Text::from(plain))
+                .wrap(Wrap { trim: false })
+                .scroll((sy, sx)),
+            rows[0],
+        );
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {hint}"),
+                Style::default().fg(DIM),
+            )))
+            .alignment(Alignment::Left),
             rows[1],
         );
-        let (line, col) = ed.input.line_col();
-        f.set_cursor_position((rows[0].x + col as u16, rows[0].y + line as u16));
+        let cx = rows[0].x + ccol.saturating_sub(sx as usize) as u16;
+        let cy = rows[0].y + cline.saturating_sub(sy as usize) as u16;
+        f.set_cursor_position((cx, cy));
     }
 }
 

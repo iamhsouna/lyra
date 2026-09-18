@@ -1,4 +1,4 @@
-use crate::detect::{self, expand_tilde, Paths};
+use crate::detect::{self, Paths, expand_tilde};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -15,7 +15,14 @@ pub const GENRES: &[&str] = &[
 ];
 
 pub const MOODS: &[&str] = &[
-    "uplifting", "melancholic", "energetic", "calm", "dark", "romantic", "dreamy", "defiant",
+    "uplifting",
+    "melancholic",
+    "energetic",
+    "calm",
+    "dark",
+    "romantic",
+    "dreamy",
+    "defiant",
 ];
 
 pub const VOCALS: &[&str] = &[
@@ -117,24 +124,37 @@ pub fn capitalize_first(s: &str) -> String {
 }
 
 impl Config {
+    /// Clamped style index (tolerates hand-edited presets / API input).
+    pub fn genre_index(&self) -> usize {
+        self.genre.min(GENRES.len().saturating_sub(1))
+    }
+
+    pub fn mood_index(&self) -> usize {
+        self.mood.min(MOODS.len().saturating_sub(1))
+    }
+
+    pub fn vocals_index(&self) -> usize {
+        self.vocals.min(VOCALS.len().saturating_sub(1))
+    }
+
     pub fn genre_text(&self) -> String {
-        if self.genre + 1 == GENRES.len() {
+        if self.is_custom_genre() {
             if self.genre_custom.trim().is_empty() {
                 "an original song".to_string()
             } else {
                 self.genre_custom.trim().to_string()
             }
         } else {
-            GENRES[self.genre].to_string()
+            GENRES[self.genre_index()].to_string()
         }
     }
 
     pub fn is_custom_genre(&self) -> bool {
-        self.genre + 1 == GENRES.len()
+        self.genre_index() + 1 == GENRES.len()
     }
 
     pub fn is_instrumental(&self) -> bool {
-        self.vocals + 1 == VOCALS.len()
+        self.vocals_index() + 1 == VOCALS.len()
     }
 
     pub fn caption(&self) -> String {
@@ -144,12 +164,33 @@ impl Config {
         let genre = capitalize_first(self.genre_text().trim());
         let mut c = format!(
             "{genre} — {} mood, {}, polished studio production.",
-            MOODS[self.mood], VOCALS[self.vocals],
+            MOODS[self.mood_index()],
+            VOCALS[self.vocals_index()],
         );
         if self.is_instrumental() {
             c.push_str(" Focus on the melody and arrangement.");
         }
         c
+    }
+
+    /// Normalise indices and numeric ranges after loading from disk or an API.
+    pub fn sanitize(&mut self) {
+        self.genre = self.genre_index();
+        self.mood = self.mood_index();
+        self.vocals = self.vocals_index();
+        self.duration_sec = clamp_f64(self.duration_sec, 1.0, 3600.0);
+        self.num_inference_steps = self.num_inference_steps.clamp(1, 500);
+        self.guidance_scale = clamp_f64(self.guidance_scale, 0.0, 20.0);
+        self.ar_guidance_scale = clamp_f64(self.ar_guidance_scale, 0.0, 20.0);
+        self.top_k = self.top_k.clamp(1, 2000);
+        self.flow_uncond_interval = self.flow_uncond_interval.clamp(1, 20);
+        self.flow_uncond_warmup = self.flow_uncond_warmup.min(20);
+        self.ensemble_takes = self.ensemble_takes.clamp(1, 16);
+        self.graph_context_mb = self.graph_context_mb.clamp(8, 4096);
+        self.weight_context_mb = self.weight_context_mb.clamp(8, 4096);
+        if !detect::BACKENDS.iter().any(|b| *b == self.backend) && !self.backend.is_empty() {
+            self.backend.clear();
+        }
     }
 
     pub fn lyrics_text(&self) -> String {
@@ -167,23 +208,42 @@ impl Config {
         expand_tilde(self.out.trim()).to_string_lossy().into_owned()
     }
 
-    pub fn warnings(&self, paths: &Paths) -> Vec<String> {
-        let mut w = Vec::new();
-        if self.duration_sec < 1.0 {
-            w.push("duration must be at least 1 second".into());
+    /// Fatal problems that make a run impossible (missing runtime/weights, bad
+    /// values). Generation is refused while this is non-empty.
+    pub fn errors(&self, paths: &Paths) -> Vec<String> {
+        let mut e = Vec::new();
+        if self.duration_sec < 1.0 || !self.duration_sec.is_finite() {
+            e.push("duration must be at least 1 second".into());
         }
         if self.num_inference_steps == 0 {
-            w.push("num_inference_steps must be >= 1".into());
+            e.push("steps must be >= 1".into());
         }
+        if self.out.trim().is_empty() {
+            e.push("output path is empty".into());
+        }
+        e.extend(detect::problems(paths));
+        e
+    }
+
+    /// Non-fatal advisories shown alongside the preview.
+    pub fn warnings(&self, paths: &Paths) -> Vec<String> {
+        let mut w = Vec::new();
         if self.pipeline_overlap && self.mem_saver {
-            w.push("pipeline_overlap needs mem_saver = false".into());
+            w.push("pipeline_overlap has no effect while mem_saver is on".into());
         }
         if self.is_instrumental() && self.lyrics.trim().is_empty() {
             w.push("instrumental selected — lyrics will be replaced with [instrumental]".into());
         }
-        w.extend(detect::problems(paths));
+        if self.duration_sec > 300.0 {
+            w.push("very long duration — generation may take a long time".into());
+        }
+        w.extend(self.errors(paths));
         w
     }
+}
+
+fn clamp_f64(v: f64, lo: f64, hi: f64) -> f64 {
+    if v.is_finite() { v.clamp(lo, hi) } else { lo }
 }
 
 /// argv for `audiocpp_cli`; `[0]` is the binary.
@@ -216,22 +276,46 @@ pub fn build_argv(paths: &Paths, c: &Config) -> Vec<String> {
     session(&mut a, "mem_saver", bool_str(c.mem_saver));
     session(&mut a, "pipeline_overlap", bool_str(c.pipeline_overlap));
     session(&mut a, "graph_context_mb", &c.graph_context_mb.to_string());
-    session(&mut a, "weight_context_mb", &c.weight_context_mb.to_string());
+    session(
+        &mut a,
+        "weight_context_mb",
+        &c.weight_context_mb.to_string(),
+    );
 
     a.push("--text".into());
     a.push(c.caption());
     req(&mut a, "lyrics", &c.lyrics_text());
     req(&mut a, "duration_sec", &fmt_f64(c.duration_sec));
-    req(&mut a, "num_inference_steps", &c.num_inference_steps.to_string());
+    req(
+        &mut a,
+        "num_inference_steps",
+        &c.num_inference_steps.to_string(),
+    );
     req(&mut a, "guidance_scale", &fmt_f64(c.guidance_scale));
     req(&mut a, "ar_guidance_scale", &fmt_f64(c.ar_guidance_scale));
     req(&mut a, "top_k", &c.top_k.to_string());
     req(&mut a, "seed", &c.seed.to_string());
-    req(&mut a, "flow_uncond_interval", &c.flow_uncond_interval.to_string());
-    req(&mut a, "flow_uncond_warmup", &c.flow_uncond_warmup.to_string());
-    req(&mut a, "flow_chunk_hop_frames", &c.flow_chunk_hop_frames.to_string());
+    req(
+        &mut a,
+        "flow_uncond_interval",
+        &c.flow_uncond_interval.to_string(),
+    );
+    req(
+        &mut a,
+        "flow_uncond_warmup",
+        &c.flow_uncond_warmup.to_string(),
+    );
+    req(
+        &mut a,
+        "flow_chunk_hop_frames",
+        &c.flow_chunk_hop_frames.to_string(),
+    );
     req(&mut a, "ensemble_takes", &c.ensemble_takes.to_string());
-    req(&mut a, "ensemble_prefix_frames", &c.ensemble_prefix_frames.to_string());
+    req(
+        &mut a,
+        "ensemble_prefix_frames",
+        &c.ensemble_prefix_frames.to_string(),
+    );
 
     a.push("--out".into());
     a.push(c.out_path());
@@ -272,7 +356,9 @@ fn req(a: &mut Vec<String>, key: &str, val: &str) {
 pub fn shell_join(argv: &[String]) -> String {
     argv.iter()
         .map(|a| {
-            if a.chars().all(|ch| ch.is_ascii_alphanumeric() || "-_./=~".contains(ch)) {
+            if a.chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || "-_./=~".contains(ch))
+            {
                 a.clone()
             } else {
                 format!("'{}'", a.replace('\'', "'\\''"))
@@ -380,8 +466,7 @@ pub const ADVANCED_FIELDS: &[Field] = &[
     Field::WeightCtx,
 ];
 
-pub const COMPONENT_FIELDS: &[Field] =
-    &[Field::Backend, Field::Lm, Field::Flow, Field::Depth];
+pub const COMPONENT_FIELDS: &[Field] = &[Field::Backend, Field::Lm, Field::Flow, Field::Depth];
 
 impl Field {
     pub fn id(self) -> &'static str {
@@ -559,8 +644,8 @@ pub fn value_string(c: &Config, f: Field) -> String {
                 c.genre_text()
             }
         }
-        Field::Mood => MOODS[c.mood].to_string(),
-        Field::Vocals => VOCALS[c.vocals].to_string(),
+        Field::Mood => MOODS[c.mood_index()].to_string(),
+        Field::Vocals => VOCALS[c.vocals_index()].to_string(),
         Field::Caption => c.caption_override.clone(),
         Field::Lyrics => c.lyrics.clone(),
         Field::Duration => fmt_f64(c.duration_sec),
@@ -586,8 +671,20 @@ pub fn value_string(c: &Config, f: Field) -> String {
                 c.backend.clone()
             }
         }
-        Field::Lm => if c.lm_gguf.is_empty() { "(auto)".into() } else { c.lm_gguf.clone() },
-        Field::Flow => if c.flow_gguf.is_empty() { "(auto)".into() } else { c.flow_gguf.clone() },
+        Field::Lm => {
+            if c.lm_gguf.is_empty() {
+                "(auto)".into()
+            } else {
+                c.lm_gguf.clone()
+            }
+        }
+        Field::Flow => {
+            if c.flow_gguf.is_empty() {
+                "(auto)".into()
+            } else {
+                c.flow_gguf.clone()
+            }
+        }
         Field::Depth => {
             if c.depth_gguf.is_empty() {
                 "(auto)".into()
@@ -610,9 +707,21 @@ pub fn select_index(c: &Config, paths: &Paths, f: Field) -> usize {
             .position(|o| o == &c.backend)
             .map(|i| i + 1)
             .unwrap_or(0),
-        Field::Lm => opts.iter().position(|o| o == &c.lm_gguf).map(|i| i + 1).unwrap_or(0),
-        Field::Flow => opts.iter().position(|o| o == &c.flow_gguf).map(|i| i + 1).unwrap_or(0),
-        Field::Depth => opts.iter().position(|o| o == &c.depth_gguf).map(|i| i + 1).unwrap_or(0),
+        Field::Lm => opts
+            .iter()
+            .position(|o| o == &c.lm_gguf)
+            .map(|i| i + 1)
+            .unwrap_or(0),
+        Field::Flow => opts
+            .iter()
+            .position(|o| o == &c.flow_gguf)
+            .map(|i| i + 1)
+            .unwrap_or(0),
+        Field::Depth => opts
+            .iter()
+            .position(|o| o == &c.depth_gguf)
+            .map(|i| i + 1)
+            .unwrap_or(0),
         _ => 0,
     }
 }
@@ -632,16 +741,32 @@ pub fn cycle(c: &mut Config, paths: &Paths, f: Field, dir: i64) {
         Field::Mood => c.mood = next as usize,
         Field::Vocals => c.vocals = next as usize,
         Field::Backend => {
-            c.backend = if next == 0 { String::new() } else { opts[(next - 1) as usize].clone() }
+            c.backend = if next == 0 {
+                String::new()
+            } else {
+                opts[(next - 1) as usize].clone()
+            }
         }
         Field::Lm => {
-            c.lm_gguf = if next == 0 { String::new() } else { opts[(next - 1) as usize].clone() }
+            c.lm_gguf = if next == 0 {
+                String::new()
+            } else {
+                opts[(next - 1) as usize].clone()
+            }
         }
         Field::Flow => {
-            c.flow_gguf = if next == 0 { String::new() } else { opts[(next - 1) as usize].clone() }
+            c.flow_gguf = if next == 0 {
+                String::new()
+            } else {
+                opts[(next - 1) as usize].clone()
+            }
         }
         Field::Depth => {
-            c.depth_gguf = if next == 0 { String::new() } else { opts[(next - 1) as usize].clone() }
+            c.depth_gguf = if next == 0 {
+                String::new()
+            } else {
+                opts[(next - 1) as usize].clone()
+            }
         }
         _ => {}
     }
@@ -698,81 +823,97 @@ pub fn toggle(c: &mut Config, f: Field) {
 
 /// Set a field from free text (used by editors and the web API).
 pub fn set_text(c: &mut Config, f: Field, s: &str) {
+    let t = s.trim();
     match f {
         Field::Genre => {
-            c.genre = GENRES.len() - 1;
+            c.genre = GENRES.len().saturating_sub(1);
             c.genre_custom = s.to_string();
         }
         Field::Caption => c.caption_override = s.to_string(),
         Field::Lyrics => c.lyrics = s.to_string(),
         Field::Out => c.out = s.to_string(),
         Field::Duration => {
-            if let Ok(v) = s.trim().parse() {
-                c.duration_sec = v;
+            if let Ok(v) = t.parse::<f64>() {
+                c.duration_sec = clamp_f64(v, 1.0, 3600.0);
             }
         }
         Field::Steps => {
-            if let Ok(v) = s.trim().parse() {
-                c.num_inference_steps = v;
+            if let Ok(v) = t.parse::<i64>() {
+                c.num_inference_steps = v.clamp(1, 500) as u32;
             }
         }
         Field::Guidance => {
-            if let Ok(v) = s.trim().parse() {
-                c.guidance_scale = v;
+            if let Ok(v) = t.parse::<f64>() {
+                c.guidance_scale = clamp_f64(v, 0.0, 20.0);
             }
         }
         Field::ArGuidance => {
-            if let Ok(v) = s.trim().parse() {
-                c.ar_guidance_scale = v;
+            if let Ok(v) = t.parse::<f64>() {
+                c.ar_guidance_scale = clamp_f64(v, 0.0, 20.0);
             }
         }
         Field::TopK => {
-            if let Ok(v) = s.trim().parse() {
-                c.top_k = v;
+            if let Ok(v) = t.parse::<i64>() {
+                c.top_k = v.clamp(1, 2000) as u32;
             }
         }
         Field::Seed => {
-            if let Ok(v) = s.trim().parse() {
+            if let Ok(v) = t.parse::<u64>() {
                 c.seed = v;
             }
         }
         Field::FlowInterval => {
-            if let Ok(v) = s.trim().parse() {
-                c.flow_uncond_interval = v;
+            if let Ok(v) = t.parse::<i64>() {
+                c.flow_uncond_interval = v.clamp(1, 20) as u32;
             }
         }
         Field::FlowWarmup => {
-            if let Ok(v) = s.trim().parse() {
-                c.flow_uncond_warmup = v;
+            if let Ok(v) = t.parse::<i64>() {
+                c.flow_uncond_warmup = v.clamp(0, 20) as u32;
             }
         }
         Field::FlowHop => {
-            if let Ok(v) = s.trim().parse() {
+            if let Ok(v) = t.parse::<u32>() {
                 c.flow_chunk_hop_frames = v;
             }
         }
         Field::EnsembleTakes => {
-            if let Ok(v) = s.trim().parse() {
-                c.ensemble_takes = v;
+            if let Ok(v) = t.parse::<i64>() {
+                c.ensemble_takes = v.clamp(1, 16) as u32;
             }
         }
         Field::EnsemblePrefix => {
-            if let Ok(v) = s.trim().parse() {
+            if let Ok(v) = t.parse::<u32>() {
                 c.ensemble_prefix_frames = v;
             }
         }
         Field::GraphCtx => {
-            if let Ok(v) = s.trim().parse() {
-                c.graph_context_mb = v;
+            if let Ok(v) = t.parse::<i64>() {
+                c.graph_context_mb = v.clamp(8, 4096) as u32;
             }
         }
         Field::WeightCtx => {
-            if let Ok(v) = s.trim().parse() {
-                c.weight_context_mb = v;
+            if let Ok(v) = t.parse::<i64>() {
+                c.weight_context_mb = v.clamp(8, 4096) as u32;
             }
         }
         _ => {}
     }
+}
+
+/// Random 64-bit seed for the "reroll" action.
+pub fn random_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    // xorshift mix
+    let mut x = t ^ 0x9e37_79b9_7f4a_7c15;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    x
 }
 
 // --- presets / history ------------------------------------------------------
@@ -790,16 +931,25 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &std::path::Path) -> Option<T> 
 }
 
 fn write_json<T: Serialize>(path: &std::path::Path, v: &T) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(s) = serde_json::to_string_pretty(v) {
-        let _ = std::fs::write(path, s);
+    let Some(parent) = path.parent() else { return };
+    let _ = std::fs::create_dir_all(parent);
+    let Ok(s) = serde_json::to_string_pretty(v) else {
+        return;
+    };
+    // Write-then-rename so a crash can never leave a half-written state file.
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, s).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
     }
 }
 
 pub fn load_presets() -> BTreeMap<String, Config> {
-    read_json(&config_dir().join("presets.json")).unwrap_or_default()
+    let mut p: BTreeMap<String, Config> =
+        read_json(&config_dir().join("presets.json")).unwrap_or_default();
+    for cfg in p.values_mut() {
+        cfg.sanitize();
+    }
+    p
 }
 
 pub fn save_presets(p: &BTreeMap<String, Config>) {
@@ -820,9 +970,96 @@ pub fn load_history() -> Vec<HistoryEntry> {
 }
 
 pub fn append_history(e: HistoryEntry) {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut h = load_history();
     h.push(e);
     let keep = h.len().saturating_sub(100);
     h.drain(0..keep);
     write_json(&config_dir().join("history.json"), &h);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::detect::Paths;
+
+    fn paths() -> Paths {
+        Paths {
+            bin: PathBuf::from("/nonexistent/audiocpp_cli"),
+            model_dir: PathBuf::from("/nonexistent/model"),
+            backend: "cuda".into(),
+            language_model: Some("language_model_q4_k.gguf".into()),
+            flow_transformer: Some("transformer_q4_k.gguf".into()),
+            depth_decoder: Some("rvq_depth_decoder_q8_0.gguf".into()),
+        }
+    }
+
+    #[test]
+    fn sanitize_clamps_out_of_range() {
+        let mut c = Config {
+            genre: 999,
+            mood: 999,
+            vocals: 999,
+            duration_sec: -5.0,
+            num_inference_steps: 0,
+            top_k: 0,
+            ensemble_takes: 99,
+            graph_context_mb: 1,
+            backend: "bogus".into(),
+            ..Config::default()
+        };
+        c.sanitize();
+        assert!(c.genre < GENRES.len());
+        assert!(c.mood < MOODS.len());
+        assert!(c.vocals < VOCALS.len());
+        assert_eq!(c.duration_sec, 1.0);
+        assert_eq!(c.num_inference_steps, 1);
+        assert_eq!(c.top_k, 1);
+        assert_eq!(c.ensemble_takes, 16);
+        assert_eq!(c.graph_context_mb, 8);
+        assert!(c.backend.is_empty());
+        // Must not panic:
+        let _ = c.caption();
+        let _ = c.warnings(&paths());
+    }
+
+    #[test]
+    fn set_text_clamps_numeric_values() {
+        let mut c = Config::default();
+        set_text(&mut c, Field::Steps, "100000");
+        assert_eq!(c.num_inference_steps, 500);
+        set_text(&mut c, Field::Guidance, "-3");
+        assert_eq!(c.guidance_scale, 0.0);
+        set_text(&mut c, Field::Duration, "not-a-number");
+        assert_eq!(c.duration_sec, 30.0); // unchanged
+    }
+
+    #[test]
+    fn backend_cycle_round_trips_through_auto() {
+        let p = paths();
+        let mut c = Config::default();
+        assert_eq!(select_index(&c, &p, Field::Backend), 0);
+        cycle(&mut c, &p, Field::Backend, 1);
+        assert_eq!(c.backend, crate::detect::BACKENDS[0]);
+        assert_eq!(select_index(&c, &p, Field::Backend), 1);
+        // cycling all the way around returns to auto
+        for _ in 0..crate::detect::BACKENDS.len() {
+            cycle(&mut c, &p, Field::Backend, 1);
+        }
+        assert!(c.backend.is_empty());
+    }
+
+    #[test]
+    fn argv_has_core_flags_and_components() {
+        let p = paths();
+        let c = Config::default();
+        let argv = build_argv(&p, &c);
+        assert!(argv.contains(&"--task".to_string()));
+        assert!(argv.contains(&"minimax_music3".to_string()));
+        assert!(argv.iter().any(|a| a.contains("language_model_gguf")));
+        assert!(argv.iter().any(|a| a == "--metrics"));
+        let joined = argv.join(" ");
+        assert!(joined.contains("--request-option duration_sec=30"));
+    }
 }

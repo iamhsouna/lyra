@@ -10,12 +10,15 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tui::TuiApp;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 const HELP: &str = "\
 Lyra — interactive local song generation with MiniMax-Music3 (audio.cpp)
 
 USAGE:
     lyra [OPTIONS]              launch the TUI
     lyra web [OPTIONS]          launch the web UI (same features)
+    lyra tui [OPTIONS]          launch the TUI explicitly
 
 OPTIONS:
     --bin <path>       audiocpp_cli binary (default: auto-detect under ~/audio.cpp/build)
@@ -25,6 +28,7 @@ OPTIONS:
     --port <port>      web bind port (default: 8282)
     --dry-run          print the audiocpp_cli command and exit
     --print-config     print resolved paths/components, warnings, and exit
+    -V, --version      print the version and exit
     -h, --help         show this help
 
 TUI keys: Tab switches tabs · ↑/↓ move · ←/→ adjust · Enter edit · g generate · ? help
@@ -43,44 +47,50 @@ fn main() -> Result<()> {
     let mut print_config = false;
 
     let mut i = 0;
-    if args.first().map(|a| a == "web").unwrap_or(false) {
-        web_mode = true;
-        i = 1;
-    }
     while i < args.len() {
-        match args[i].as_str() {
-            "--bin" => {
-                i += 1;
-                bin = args.get(i).map(PathBuf::from);
+        let arg = args[i].as_str();
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) => (f, Some(v.to_string())),
+            None => (arg, None),
+        };
+        let next = |i: &mut usize| -> Option<String> {
+            if let Some(v) = &inline {
+                Some(v.clone())
+            } else {
+                *i += 1;
+                args.get(*i).cloned()
             }
-            "--model" => {
-                i += 1;
-                model = args.get(i).map(PathBuf::from);
-            }
-            "--backend" => {
-                i += 1;
-                backend = args.get(i).cloned();
-            }
+        };
+        match flag {
+            "web" => web_mode = true,
+            "tui" => web_mode = false,
+            "--bin" => bin = next(&mut i).map(PathBuf::from),
+            "--model" => model = next(&mut i).map(PathBuf::from),
+            "--backend" => backend = next(&mut i),
             "--host" => {
-                i += 1;
-                if let Some(v) = args.get(i) {
-                    host = v.clone();
+                if let Some(v) = next(&mut i) {
+                    host = v;
                 }
             }
-            "--port" => {
-                i += 1;
-                if let Some(v) = args.get(i).and_then(|s| s.parse().ok()) {
-                    port = v;
+            "--port" => match next(&mut i).and_then(|s| s.parse::<u16>().ok()) {
+                Some(v) => port = v,
+                None => {
+                    eprintln!("error: --port requires a number between 0 and 65535");
+                    std::process::exit(2);
                 }
-            }
+            },
             "--dry-run" => dry_run = true,
             "--print-config" => print_config = true,
+            "-V" | "--version" => {
+                println!("lyra {VERSION}");
+                return Ok(());
+            }
             "-h" | "--help" => {
                 print!("{HELP}");
                 return Ok(());
             }
             other => {
-                eprintln!("unknown argument: {other}\n");
+                eprintln!("error: unknown argument: {other}\n");
                 eprint!("{HELP}");
                 std::process::exit(2);
             }
@@ -110,6 +120,11 @@ fn main() -> Result<()> {
     }
 
     if web_mode {
+        if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+            eprintln!(
+                "⚠  binding {host}: the web UI has no authentication — keep it on a trusted network"
+            );
+        }
         return web::serve(paths, &host, port);
     }
     run_tui(TuiApp::new(paths))
@@ -120,10 +135,10 @@ fn run_tui(mut app: TuiApp) -> Result<()> {
     let result = (|| -> Result<()> {
         loop {
             terminal.draw(|frame| app.draw(frame))?;
-            if event::poll(Duration::from_millis(120))? {
-                if let Event::Key(key) = event::read()? {
-                    app.on_key(key);
-                }
+            if event::poll(Duration::from_millis(120))?
+                && let Event::Key(key) = event::read()?
+            {
+                app.on_key(key);
             }
             app.on_tick();
             if app.should_quit {
@@ -133,5 +148,11 @@ fn run_tui(mut app: TuiApp) -> Result<()> {
         Ok(())
     })();
     ratatui::restore();
+    if let Some(job) = &app.job
+        && job.running()
+    {
+        job.abort();
+        std::thread::sleep(Duration::from_millis(250));
+    }
     result
 }
